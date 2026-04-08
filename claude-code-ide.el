@@ -87,6 +87,7 @@
 (declare-function eat-term-send-string "eat" (terminal string))
 (declare-function eat-term-display-cursor "eat" (terminal))
 (declare-function eat--adjust-process-window-size "eat" (process windows))
+(declare-function eat--filter "eat" (process output))
 
 ;;; Customization
 
@@ -274,6 +275,31 @@ without noticeable latency."
   :type 'number
   :group 'claude-code-ide)
 
+(defcustom claude-code-ide-eat-anti-flicker t
+  "Enable intelligent flicker reduction for eat display.
+When enabled, this feature optimizes terminal rendering by detecting
+and batching rapid update sequences from Claude Code, mirroring the
+vterm anti-flicker behavior.  This reduces the jarring rapid-scroll
+effect that occurs when Claude clears scrollback and redraws history,
+most visibly on window resize.
+
+The detection logic is shared with the vterm smart renderer; only the
+batching window and the underlying filter target differ."
+  :type 'boolean
+  :group 'claude-code-ide)
+
+(defcustom claude-code-ide-eat-render-delay 0.010
+  "Rendering optimization delay for batched eat terminal updates.
+This parameter defines the collection window for related terminal
+update sequences when eat anti-flicker mode is active.
+
+The 0.010 second (10ms) default is slightly larger than the vterm
+counterpart because eat's own latency batching already smooths normal
+output, so a wider window absorbs Claude's chunk-splitting across
+multiple read cycles without perceptible delay."
+  :type 'number
+  :group 'claude-code-ide)
+
 (defcustom claude-code-ide-eat-preserve-position t
   "Maintain terminal scroll position when switching windows.
 When enabled, prevents the eat terminal from jumping to the top
@@ -306,13 +332,20 @@ a more stable viewing experience when working with multiple windows."
 (defvar claude-code-ide--last-accessed-buffer nil
   "The most recently accessed Claude Code buffer.")
 
-;;; Vterm Rendering Optimization
+;;; Terminal Rendering Optimization
 
 (defvar-local claude-code-ide--vterm-render-queue nil
   "List of pending terminal output strings awaiting batched rendering.
 Stored in reverse order for O(1) push, joined at flush time.")
 
 (defvar-local claude-code-ide--vterm-render-timer nil
+  "Timer for executing queued rendering operations.")
+
+(defvar-local claude-code-ide--eat-render-queue nil
+  "List of pending terminal output strings awaiting batched rendering.
+Stored in reverse order for O(1) push, joined at flush time.")
+
+(defvar-local claude-code-ide--eat-render-timer nil
   "Timer for executing queued rendering operations.")
 
 (defun claude-code-ide--count-escape-sequence (sequence input)
@@ -323,6 +356,25 @@ More efficient than split-string + cl-count-if for simple counting."
       (cl-incf count)
       (cl-incf start (length sequence)))
     count))
+
+(defun claude-code-ide--detect-complex-redraw (input)
+  "Return non-nil if INPUT looks like a complex terminal redraw sequence.
+Detects two patterns characteristic of Claude Code's full-history redraws:
+1. Repeated vertical cursor moves combined with line clears.
+2. High escape-sequence density combined with multiple line clears.
+This detector is backend-agnostic and shared between the vterm and eat
+smart renderers."
+  (let* ((complex-redraw-detected
+          (string-match-p "\033\\[[0-9]*A.*\033\\[K.*\033\\[[0-9]*A.*\033\\[K" input))
+         (clear-count (claude-code-ide--count-escape-sequence "\033[K" input))
+         (escape-count (cl-count ?\033 input))
+         (input-length (length input))
+         (escape-density (if (> input-length 0)
+                             (/ (float escape-count) input-length)
+                           0)))
+    (or complex-redraw-detected
+        (and (> escape-density 0.3)
+             (>= clear-count 2)))))
 
 (defun claude-code-ide--vterm-smart-renderer (orig-fun process input)
   "Smart rendering filter for optimized vterm display updates.
@@ -343,57 +395,89 @@ INPUT contains the terminal output stream."
       (if (and (not claude-code-ide--vterm-render-queue)
                (not (string-search "\033" input)))
           (funcall orig-fun process input)
-        ;; Detect rapid terminal redraw sequences
-        ;; Pattern analysis for complex terminal updates:
-        ;; - Vertical cursor movements (ESC[<n>A)
-        ;; - Line clearing operations (ESC[K)
-        ;; - High escape sequence density
-        (let* ((complex-redraw-detected
-                ;; Pattern: vertical movement + clear, repeated
-                (string-match-p "\033\\[[0-9]*A.*\033\\[K.*\033\\[[0-9]*A.*\033\\[K" input))
-               (clear-count (claude-code-ide--count-escape-sequence "\033[K" input))
-               (escape-count (cl-count ?\033 input))
-               (input-length (length input))
-               ;; High escape density indicates redrawing, not normal output
-               (escape-density (if (> input-length 0)
-                                   (/ (float escape-count) input-length)
-                                 0)))
-          ;; Optimize rendering for detected patterns:
-          ;; 1. Complex redraw sequence detected, OR
-          ;; 2. Escape sequence density exceeds threshold with line operations
-          ;; 3. OR already queuing (to complete the sequence)
-          (if (or complex-redraw-detected
-                  (and (> escape-density 0.3)
-                       (>= clear-count 2))
-                  claude-code-ide--vterm-render-queue)
-              (progn
-                ;; Add to queue (list for O(1) push, joined at flush time)
-                (push input claude-code-ide--vterm-render-queue)
-                ;; Reset existing render timer
-                (when claude-code-ide--vterm-render-timer
-                  (cancel-timer claude-code-ide--vterm-render-timer))
-                ;; Schedule optimized rendering
-                ;; Timing calibrated for visual quality
-                (setq claude-code-ide--vterm-render-timer
-                      (run-at-time claude-code-ide-vterm-render-delay nil
-                                   (lambda (buf)
-                                     (when (buffer-live-p buf)
-                                       (with-current-buffer buf
-                                         (when claude-code-ide--vterm-render-queue
-                                           (let* ((inhibit-redisplay t)
-                                                  (queue claude-code-ide--vterm-render-queue)
-                                                  ;; Join list in correct order
-                                                  (data (apply #'concat (nreverse queue))))
-                                             ;; Clear queue first to prevent recursion
-                                             (setq claude-code-ide--vterm-render-queue nil
-                                                   claude-code-ide--vterm-render-timer nil)
-                                             ;; Execute queued rendering
-                                             (funcall orig-fun
-                                                      (get-buffer-process buf)
-                                                      data))))))
-                                   (current-buffer))))
-            ;; Standard processing for regular output
-            (funcall orig-fun process input)))))))
+        ;; Optimize rendering for detected patterns:
+        ;; 1. Complex redraw sequence detected (delegated to shared helper)
+        ;; 2. OR already queuing (to complete the sequence)
+        (if (or (claude-code-ide--detect-complex-redraw input)
+                claude-code-ide--vterm-render-queue)
+            (progn
+              ;; Add to queue (list for O(1) push, joined at flush time)
+              (push input claude-code-ide--vterm-render-queue)
+              ;; Reset existing render timer
+              (when claude-code-ide--vterm-render-timer
+                (cancel-timer claude-code-ide--vterm-render-timer))
+              ;; Schedule optimized rendering
+              ;; Timing calibrated for visual quality
+              (setq claude-code-ide--vterm-render-timer
+                    (run-at-time claude-code-ide-vterm-render-delay nil
+                                 (lambda (buf)
+                                   (when (buffer-live-p buf)
+                                     (with-current-buffer buf
+                                       (when claude-code-ide--vterm-render-queue
+                                         (let* ((inhibit-redisplay t)
+                                                (queue claude-code-ide--vterm-render-queue)
+                                                ;; Join list in correct order
+                                                (data (apply #'concat (nreverse queue))))
+                                           ;; Clear queue first to prevent recursion
+                                           (setq claude-code-ide--vterm-render-queue nil
+                                                 claude-code-ide--vterm-render-timer nil)
+                                           ;; Execute queued rendering
+                                           (funcall orig-fun
+                                                    (get-buffer-process buf)
+                                                    data))))))
+                                 (current-buffer))))
+          ;; Standard processing for regular output
+          (funcall orig-fun process input))))))
+
+(defun claude-code-ide--eat-smart-renderer (orig-fun process input)
+  "Smart rendering filter for optimized eat display updates.
+This advice wraps `eat--filter' so that complex Claude Code redraw
+sequences are withheld in a buffer-local queue and flushed in a single
+batch.  Because we never forward the held chunks to ORIG-FUN, eat's
+own internal output queue (`eat--pending-output-chunks') only sees the
+merged blob at flush time.
+
+ORIG-FUN is the underlying `eat--filter'.
+PROCESS is the eat process being optimized.
+INPUT contains the terminal output stream."
+  (if (or (not claude-code-ide-eat-anti-flicker)
+          (not (claude-code-ide--session-buffer-p (process-buffer process))))
+      ;; Feature disabled or not a Claude buffer, pass through normally
+      (funcall orig-fun process input)
+    (with-current-buffer (process-buffer process)
+      ;; Fast path: plain text with no active queue skips all pattern detection
+      (if (and (not claude-code-ide--eat-render-queue)
+               (not (string-search "\033" input)))
+          (funcall orig-fun process input)
+        (if (or (claude-code-ide--detect-complex-redraw input)
+                claude-code-ide--eat-render-queue)
+            (progn
+              ;; Add to queue (list for O(1) push, joined at flush time)
+              (push input claude-code-ide--eat-render-queue)
+              ;; Reset existing render timer
+              (when claude-code-ide--eat-render-timer
+                (cancel-timer claude-code-ide--eat-render-timer))
+              ;; Schedule optimized rendering
+              (setq claude-code-ide--eat-render-timer
+                    (run-at-time claude-code-ide-eat-render-delay nil
+                                 (lambda (buf)
+                                   (when (buffer-live-p buf)
+                                     (with-current-buffer buf
+                                       (when claude-code-ide--eat-render-queue
+                                         (let* ((inhibit-redisplay t)
+                                                (queue claude-code-ide--eat-render-queue)
+                                                (data (apply #'concat (nreverse queue))))
+                                           ;; Clear queue first to prevent recursion
+                                           (setq claude-code-ide--eat-render-queue nil
+                                                 claude-code-ide--eat-render-timer nil)
+                                           ;; Hand the merged blob to eat's real
+                                           ;; filter so its own batching pipeline
+                                           ;; processes it as a single chunk.
+                                           (when-let ((proc (get-buffer-process buf)))
+                                             (funcall orig-fun proc data)))))))
+                                 (current-buffer))))
+          ;; Standard processing for regular output
+          (funcall orig-fun process input))))))
 
 (defvar-local claude-code-ide--saved-cursor-type nil
   "Saved cursor-type before entering vterm-copy-mode.")
@@ -442,6 +526,23 @@ cursor management, and process buffering for superior user experience."
   ;; Set up rendering optimization
   (when claude-code-ide-vterm-anti-flicker
     (advice-add 'vterm--filter :around #'claude-code-ide--vterm-smart-renderer)))
+
+(defun claude-code-ide--cancel-eat-render-timer ()
+  "Cancel any pending eat render timer in the current buffer.
+Used as a `kill-buffer-hook' to make sure timers do not outlive the
+buffer they were scheduled for."
+  (when claude-code-ide--eat-render-timer
+    (cancel-timer claude-code-ide--eat-render-timer)
+    (setq claude-code-ide--eat-render-timer nil)))
+
+(defun claude-code-ide--configure-eat-buffer ()
+  "Configure eat for enhanced performance and visual quality.
+Installs the eat smart renderer advice when enabled and registers a
+buffer-local kill hook so that pending render timers cannot outlive
+the buffer."
+  (when claude-code-ide-eat-anti-flicker
+    (advice-add 'eat--filter :around #'claude-code-ide--eat-smart-renderer))
+  (add-hook 'kill-buffer-hook #'claude-code-ide--cancel-eat-render-timer nil t))
 
 
 ;;; Terminal Backend Abstraction
@@ -922,6 +1023,8 @@ Signals an error if terminal fails to initialize."
           ;; Set up eat mode
           (unless (eq major-mode 'eat-mode)
             (eat-mode))
+          ;; Configure eat buffer (smart renderer advice + cleanup hook)
+          (claude-code-ide--configure-eat-buffer)
           ;; Configure position preservation if enabled
           (when claude-code-ide-eat-preserve-position
             (setq-local eat--synchronize-scroll-function

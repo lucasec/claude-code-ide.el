@@ -569,6 +569,107 @@ have completed before cleanup.  Waits up to 5 seconds."
                              complex-input))
               (should (equal timer-created 0.005)))))))))
 
+(ert-deftest claude-code-ide-test-detect-complex-redraw ()
+  "Test the shared complex-redraw detector."
+  ;; Plain text: not a redraw
+  (should-not (claude-code-ide--detect-complex-redraw "Hello World"))
+  ;; Single escape sequence: not enough
+  (should-not (claude-code-ide--detect-complex-redraw "\033[1A"))
+  ;; Repeated vertical-move + line-clear pattern matches
+  (should (claude-code-ide--detect-complex-redraw "\033[2A\033[K\033[3A\033[K"))
+  ;; High escape density with >= 2 line clears matches
+  (should (claude-code-ide--detect-complex-redraw "\033[K\033[K\033[m")))
+
+(ert-deftest claude-code-ide-test-eat-smart-renderer-passthrough ()
+  "Test that eat smart renderer passes through normal text immediately."
+  (let ((orig-fun-called nil)
+        (orig-fun-input nil)
+        (claude-code-ide-eat-anti-flicker t))
+    (cl-letf (((symbol-function 'claude-code-ide--session-buffer-p)
+               (lambda (_) t)))
+      (with-temp-buffer
+        (let ((claude-code-ide--eat-render-queue nil)
+              (claude-code-ide--eat-render-timer nil)
+              (mock-process (make-process :name "mock"
+                                          :buffer (current-buffer)
+                                          :command '("true"))))
+          (let ((orig-fun (lambda (_process input)
+                            (setq orig-fun-called t
+                                  orig-fun-input input))))
+            (claude-code-ide--eat-smart-renderer orig-fun mock-process "Hello World")
+            (should orig-fun-called)
+            (should (equal orig-fun-input "Hello World"))
+            (should-not claude-code-ide--eat-render-queue)))))))
+
+(ert-deftest claude-code-ide-test-eat-smart-renderer-batching ()
+  "Test that eat smart renderer batches complex escape sequences."
+  (let ((orig-fun-called nil)
+        (timer-created nil)
+        (claude-code-ide-eat-anti-flicker t)
+        (claude-code-ide-eat-render-delay 0.010))
+    (cl-letf (((symbol-function 'claude-code-ide--session-buffer-p)
+               (lambda (_) t))
+              ((symbol-function 'run-at-time)
+               (lambda (delay &rest _)
+                 (setq timer-created delay)
+                 'mock-timer))
+              ((symbol-function 'cancel-timer)
+               (lambda (_) nil)))
+      (with-temp-buffer
+        (let ((claude-code-ide--eat-render-queue nil)
+              (claude-code-ide--eat-render-timer nil)
+              (mock-process (make-process :name "mock"
+                                          :buffer (current-buffer)
+                                          :command '("true"))))
+          (let ((orig-fun (lambda (_process _input)
+                            (setq orig-fun-called t))))
+            (let ((complex-input "\033[2A\033[K\033[3A\033[K"))
+              (claude-code-ide--eat-smart-renderer orig-fun mock-process complex-input)
+              (should-not orig-fun-called)
+              (should (listp claude-code-ide--eat-render-queue))
+              (should (equal (apply #'concat (nreverse claude-code-ide--eat-render-queue))
+                             complex-input))
+              (should (equal timer-created 0.010)))))))))
+
+(ert-deftest claude-code-ide-test-eat-smart-renderer-disabled ()
+  "Test that eat smart renderer passes through when disabled."
+  (let ((orig-fun-call-count 0)
+        (claude-code-ide-eat-anti-flicker nil))
+    (cl-letf (((symbol-function 'claude-code-ide--session-buffer-p)
+               (lambda (_) t)))
+      (with-temp-buffer
+        (let ((claude-code-ide--eat-render-queue nil)
+              (claude-code-ide--eat-render-timer nil)
+              (mock-process (make-process :name "mock"
+                                          :buffer (current-buffer)
+                                          :command '("true"))))
+          (let ((orig-fun (lambda (_process _input)
+                            (cl-incf orig-fun-call-count))))
+            ;; Even a complex pattern is forwarded immediately when disabled
+            (claude-code-ide--eat-smart-renderer orig-fun mock-process
+                                                 "\033[2A\033[K\033[3A\033[K")
+            (should (= orig-fun-call-count 1))
+            (should-not claude-code-ide--eat-render-queue)))))))
+
+(ert-deftest claude-code-ide-test-eat-smart-renderer-non-session-buffer ()
+  "Test that eat smart renderer passes through for non-Claude buffers."
+  (let ((orig-fun-call-count 0)
+        (claude-code-ide-eat-anti-flicker t))
+    (cl-letf (((symbol-function 'claude-code-ide--session-buffer-p)
+               (lambda (_) nil)))
+      (with-temp-buffer
+        (let ((claude-code-ide--eat-render-queue nil)
+              (claude-code-ide--eat-render-timer nil)
+              (mock-process (make-process :name "mock"
+                                          :buffer (current-buffer)
+                                          :command '("true"))))
+          (let ((orig-fun (lambda (_process _input)
+                            (cl-incf orig-fun-call-count))))
+            (claude-code-ide--eat-smart-renderer orig-fun mock-process
+                                                 "\033[2A\033[K\033[3A\033[K")
+            (should (= orig-fun-call-count 1))
+            (should-not claude-code-ide--eat-render-queue)))))))
+
 (ert-deftest claude-code-ide-test-toggle-vterm-optimization ()
   "Test toggling vterm optimization on and off."
   (let ((original-value claude-code-ide-vterm-anti-flicker)
