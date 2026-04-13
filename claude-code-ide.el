@@ -537,7 +537,6 @@ This function binds:
   "Determine if terminal is currently in scroll/copy mode."
   (pcase claude-code-ide-terminal-backend
     ('vterm (bound-and-true-p vterm-copy-mode))
-    ('eat (not (bound-and-true-p eat--semi-char-mode)))
     (_ nil)))
 
 (defun claude-code-ide--session-buffer-p (buffer)
@@ -545,36 +544,66 @@ This function binds:
   (when-let ((name (if (stringp buffer) buffer (buffer-name buffer))))
     (string-prefix-p "*claude-code[" name)))
 
+(defvar-local claude-code-ide--last-reported-size nil
+  "The last terminal size reported as (WIDTH . HEIGHT), or nil if never reported.")
+
+(defvar claude-code-ide--reflow-bypass nil
+  "When non-nil, the reflow filter passes through unconditionally.")
+
+(defun claude-code-ide--flush-pending-reflow (_frame)
+  "Send a deferred resize if the terminal size has changed since last report.
+Called via `window-selection-change-functions' when a window is selected.
+_FRAME is the frame whose selection changed (ignored)."
+  (when-let* ((buf (window-buffer (selected-window)))
+              ((claude-code-ide--session-buffer-p buf))
+              ((buffer-local-value 'claude-code-ide--last-reported-size buf)))
+    (with-current-buffer buf
+      (let ((cur-width (window-max-chars-per-line))
+            (cur-height (floor (window-screen-lines))))
+        (unless (equal claude-code-ide--last-reported-size
+                       (cons cur-width cur-height))
+          (let ((claude-code-ide--reflow-bypass t))
+            (funcall (claude-code-ide--terminal-resize-handler)
+                     (get-buffer-process buf)
+                     (get-buffer-window-list buf nil t))))))))
+
+
 (defun claude-code-ide--terminal-reflow-filter (original-fn &rest args)
   "Filter terminal reflows to prevent height-only resize triggers.
 This wraps ORIGINAL-FN to suppress reflow signals unless the terminal
 width has actually changed, working around the scrolling glitch."
-  (let* ((base-result (apply original-fn args))
-         (dimensions-stable t))
-    ;; Examine each window showing a Claude session
-    (dolist (win (window-list))
-      (when-let* ((buf (window-buffer win))
-                  ((claude-code-ide--session-buffer-p buf)))
-        (let* ((new-width (window-width win))
-               (cached-width (window-parameter win 'claude-code-ide-cached-width)))
-          ;; Width change detected
-          (unless (eql new-width cached-width)
-            (setq dimensions-stable nil)
-            (set-window-parameter win 'claude-code-ide-cached-width new-width)))))
-    ;; Decide whether to allow reflow
-    (cond
-     ;; Not in a Claude buffer - pass through
-     ((not (claude-code-ide--session-buffer-p (current-buffer)))
-      base-result)
-     ;; In scroll mode - suppress reflow
-     ((claude-code-ide--terminal-scroll-mode-active-p)
-      nil)
-     ;; Dimensions changed - allow reflow
-     ((not dimensions-stable)
-      base-result)
-     ;; No width change - suppress reflow
-     (t nil))))
-
+  (if (or claude-code-ide--reflow-bypass
+          (not (claude-code-ide--session-buffer-p (current-buffer))))
+      ;; Bypass or not in a Claude buffer - pass through and record size
+      (let ((result (apply original-fn args)))
+        (when (and result (claude-code-ide--session-buffer-p (current-buffer)))
+          (setq claude-code-ide--last-reported-size
+                (cons (car result) (cdr result))))
+        result)
+    ;; Check if width actually changed for any Claude session window
+    (let ((dimensions-stable t))
+      (dolist (win (window-list))
+        (when-let* ((buf (window-buffer win))
+                    ((claude-code-ide--session-buffer-p buf)))
+          (let* ((new-width (window-width win))
+                 (cached-width (window-parameter win 'claude-code-ide-cached-width)))
+            (unless (eql new-width cached-width)
+              (setq dimensions-stable nil)
+              (set-window-parameter win 'claude-code-ide-cached-width new-width)))))
+      (cond
+       ;; In scroll mode - suppress reflow entirely
+       ((claude-code-ide--terminal-scroll-mode-active-p)
+        nil)
+       ;; Width changed - allow reflow and record reported size
+       ((not dimensions-stable)
+        (let ((result (apply original-fn args)))
+          (when result
+            (setq claude-code-ide--last-reported-size
+                  (cons (car result) (cdr result))))
+          result))
+       ;; No width change - suppress, will flush on window selection
+       (t
+        nil)))))
 
 ;;; Helper Functions
 
@@ -603,11 +632,13 @@ If DIRECTORY is not provided, use the current working directory."
 (defun claude-code-ide--set-process (process &optional directory)
   "Set the Claude Code PROCESS for DIRECTORY or current working directory."
   ;; Check if this is the first session starting
-  (when (and claude-code-ide-prevent-reflow-glitch
-             (= (hash-table-count claude-code-ide--processes) 0))
+  (when (= (hash-table-count claude-code-ide--processes) 0)
     ;; Apply advice globally for the first session
-    (advice-add (claude-code-ide--terminal-resize-handler)
-                :around #'claude-code-ide--terminal-reflow-filter))
+    (when claude-code-ide-prevent-reflow-glitch
+      (advice-add (claude-code-ide--terminal-resize-handler)
+                  :around #'claude-code-ide--terminal-reflow-filter)
+      (add-hook 'window-selection-change-functions
+                #'claude-code-ide--flush-pending-reflow))
   (puthash (or directory (claude-code-ide--get-working-directory))
            process
            claude-code-ide--processes))
@@ -689,11 +720,12 @@ If `claude-code-ide-focus-on-open' is non-nil, the window is selected."
           ;; Remove from process table
           (remhash directory claude-code-ide--processes)
           ;; Check if this was the last session
-          (when (and claude-code-ide-prevent-reflow-glitch
-                     (= (hash-table-count claude-code-ide--processes) 0))
+          (when (= (hash-table-count claude-code-ide--processes) 0)
             ;; Remove advice globally when no sessions remain
             (advice-remove (claude-code-ide--terminal-resize-handler)
-                           #'claude-code-ide--terminal-reflow-filter))
+                           #'claude-code-ide--terminal-reflow-filter)
+            (remove-hook 'window-selection-change-functions
+                         #'claude-code-ide--flush-pending-reflow))
           ;; Remove vterm rendering optimization if no sessions remain
           (when (and (eq claude-code-ide-terminal-backend 'vterm)
                      claude-code-ide-vterm-anti-flicker
@@ -917,6 +949,13 @@ Signals an error if terminal fails to initialize."
           (when claude-code-ide-eat-preserve-position
             (setq-local eat--synchronize-scroll-function
                         #'claude-code-ide--terminal-position-keeper))
+          ;; Record initial terminal size for deferred resize tracking
+          (when claude-code-ide-prevent-reflow-glitch
+            (when-let ((win (get-buffer-window buffer t)))
+              (setq-local claude-code-ide--last-reported-size
+                          (with-selected-window win
+                            (cons (window-max-chars-per-line)
+                                  (floor (window-screen-lines)))))))
           ;; Prepend our env vars to the buffer-local process-environment
           (setq-local process-environment
                       (append env-vars process-environment))
