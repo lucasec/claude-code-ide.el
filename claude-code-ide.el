@@ -68,7 +68,6 @@
 
 ;; External variable declarations
 (defvar eat-terminal)
-(defvar eat--synchronize-scroll-function)
 (defvar vterm-shell)
 (defvar vterm-environment)
 (defvar eat-term-name)
@@ -268,10 +267,16 @@ without noticeable latency."
   :group 'claude-code-ide)
 
 (defcustom claude-code-ide-eat-preserve-position t
-  "Maintain terminal scroll position when switching windows.
-When enabled, prevents the eat terminal from jumping to the top
-when you switch focus to other windows and return.  This provides
-a more stable viewing experience when working with multiple windows."
+  "Attempt to preserve scroll position when Claude Code redraws.
+When you re-size the terminal window (and in a few other circumstances),
+Claude Code may clear and re-write the scrollback buffer. If you have
+currently scrolled into the scrollback, this can cause you to lose your
+position.
+
+When non-nil (default), the current cursor position relative to the end
+of the buffer is captured before and restored after the redraw. Due to
+changes in extra characters Claude inserts for text wrapping, the
+position restoration may not be exact."
   :type 'boolean
   :group 'claude-code-ide)
 
@@ -605,6 +610,59 @@ width has actually changed, working around the scrolling glitch."
        (t
         nil)))))
 
+
+(defvar-local claude-code-ide--display-erased nil
+  "Non-nil when erase-in-disp was called during current output processing.")
+
+(defun claude-code-ide--track-scrollback-clear (original-fn &optional n)
+  "Advice around `eat--t-erase-in-disp' to flag display clears.
+ORIGINAL-FN is called with N.  Sets a flag when N is 2 or 3."
+  (when (memq n '(2 3))
+    (setq claude-code-ide--display-erased t))
+  (funcall original-fn n))
+
+(defun claude-code-ide--preserve-scroll-position (original-fn buffer)
+  "Preserve scroll position across display clears during output processing.
+Wraps ORIGINAL-FN (eat--process-output-queue) for BUFFER.
+Saves window state BEFORE dispatch, restores AFTER if a clear occurred."
+  (if (not (and (buffer-live-p buffer)
+                (claude-code-ide--session-buffer-p (buffer-name buffer))))
+      (funcall original-fn buffer)
+    (with-current-buffer buffer
+      (let* ((pmax (point-max))
+             (cursor (and eat-terminal
+                          (eat-term-display-cursor eat-terminal)))
+             (saved
+              (when cursor
+                (let (result)
+                  (dolist (win (get-buffer-window-list nil nil t))
+                    (let ((wpoint (window-point win)))
+                      (when (/= wpoint cursor)
+                        (push (list win
+                                    (- pmax (window-start win))
+                                    (- pmax wpoint))
+                              result))))
+                  result))))
+        (setq claude-code-ide--display-erased nil)
+        (funcall original-fn buffer)
+        (when (and saved claude-code-ide--display-erased)
+          (let ((new-pmax (point-max))
+                (new-pmin (point-min)))
+            (dolist (entry saved)
+              (let* ((win (nth 0 entry))
+                     (start-offset (nth 1 entry))
+                     (point-offset (nth 2 entry)))
+                (when (and (window-live-p win)
+                           (eq (window-buffer win) (current-buffer)))
+                  (let ((new-start
+                         (save-excursion
+                           (goto-char (max new-pmin
+                                           (- new-pmax start-offset)))
+                           (line-beginning-position)))
+                        (new-point
+                         (max new-pmin (- new-pmax point-offset))))
+                    (set-window-start win new-start t)
+                    (set-window-point win new-point)))))))))))
 ;;; Helper Functions
 
 (defun claude-code-ide--default-buffer-name (directory)
@@ -639,6 +697,11 @@ If DIRECTORY is not provided, use the current working directory."
                   :around #'claude-code-ide--terminal-reflow-filter)
       (add-hook 'window-selection-change-functions
                 #'claude-code-ide--flush-pending-reflow))
+    (when claude-code-ide-eat-preserve-position
+      (advice-add 'eat--process-output-queue
+                  :around #'claude-code-ide--preserve-scroll-position)
+      (advice-add 'eat--t-erase-in-disp
+                  :around #'claude-code-ide--track-scrollback-clear)))
   (puthash (or directory (claude-code-ide--get-working-directory))
            process
            claude-code-ide--processes))
@@ -724,6 +787,10 @@ If `claude-code-ide-focus-on-open' is non-nil, the window is selected."
             ;; Remove advice globally when no sessions remain
             (advice-remove (claude-code-ide--terminal-resize-handler)
                            #'claude-code-ide--terminal-reflow-filter)
+            (advice-remove 'eat--process-output-queue
+                           #'claude-code-ide--preserve-scroll-position)
+            (advice-remove 'eat--t-erase-in-disp
+                           #'claude-code-ide--track-scrollback-clear)
             (remove-hook 'window-selection-change-functions
                          #'claude-code-ide--flush-pending-reflow))
           ;; Remove vterm rendering optimization if no sessions remain
@@ -846,32 +913,6 @@ Additional flags from `claude-code-ide-cli-extra-flags' are also included."
               (setq claude-cmd (concat claude-cmd " --allowedTools " allowed-tools)))))))
     claude-cmd))
 
-(defun claude-code-ide--terminal-position-keeper (window-list)
-  "Maintain stable terminal view position across window switches.
-WINDOW-LIST contains windows requiring position synchronization.
-Implements intelligent scroll management to preserve user context
-when navigating between terminal and other buffers."
-  (dolist (win window-list)
-    (if (eq win 'buffer)
-        ;; Direct buffer point update
-        (goto-char (eat-term-display-cursor eat-terminal))
-      ;; Window-specific position management
-      (unless buffer-read-only  ; Skip when terminal is in navigation mode
-        (let ((terminal-point (eat-term-display-cursor eat-terminal)))
-          ;; Update window point to match terminal state
-          (set-window-point win terminal-point)
-          ;; Apply smart positioning strategy
-          (cond
-           ;; Terminal at bottom: maintain bottom alignment for active prompts
-           ((>= terminal-point (- (point-max) 2))
-            (with-selected-window win
-              (goto-char terminal-point)
-              (recenter -1)))  ; Pin to bottom
-           ;; Terminal out of view: restore visibility
-           ((not (pos-visible-in-window-p terminal-point win))
-            (with-selected-window win
-              (goto-char terminal-point)
-              (recenter)))))))))
 
 (defun claude-code-ide--parse-command-string (command-string)
   "Parse a command string into (program . args) for eat-exec.
@@ -945,10 +986,6 @@ Signals an error if terminal fails to initialize."
           ;; Set up eat mode
           (unless (eq major-mode 'eat-mode)
             (eat-mode))
-          ;; Configure position preservation if enabled
-          (when claude-code-ide-eat-preserve-position
-            (setq-local eat--synchronize-scroll-function
-                        #'claude-code-ide--terminal-position-keeper))
           ;; Record initial terminal size for deferred resize tracking
           (when claude-code-ide-prevent-reflow-glitch
             (when-let ((win (get-buffer-window buffer t)))
