@@ -939,7 +939,7 @@ Signals an error if terminal fails to initialize."
   (let* ((claude-cmd (claude-code-ide--build-claude-command continue resume session-id))
          (default-directory working-dir)
          (env-vars (list (format "CLAUDE_CODE_SSE_PORT=%d" port)
-                         "TERM_PROGRAM=emacs"
+                         "TERM_PROGRAM=ghostty"
                          "FORCE_CODE_TERMINAL=true")))
     ;; Log the command for debugging
     (claude-code-ide-debug "Starting Claude with command: %s" claude-cmd)
@@ -977,7 +977,6 @@ Signals an error if terminal fails to initialize."
      ;; eat backend
      ((eq claude-code-ide-terminal-backend 'eat)
       (let* ((buffer (get-buffer-create buffer-name))
-             (eat-term-name "xterm-256color")
              ;; Parse command string into program and args
              (cmd-parts (claude-code-ide--parse-command-string claude-cmd))
              (program (car cmd-parts))
