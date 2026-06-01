@@ -530,22 +530,17 @@ Optional SESSION contains the MCP session context."
   (claude-code-ide-debug "WebSocket state: %s" (websocket-ready-state ws))
   (claude-code-ide-debug "WebSocket URL: %s" (websocket-url ws))
 
-  ;; Find the session that owns this connection
-  ;; We need to extract the port from the websocket connection info
-  (let ((session nil)
-        (port nil))
-    ;; Try to extract port from the websocket string representation
-    ;; Format: "websocket server on port XXXXX <127.0.0.1:YYYYY>"
-    (let ((ws-string (format "%s" ws)))
-      (claude-code-ide-debug "WebSocket string representation: %s" ws-string)
-      (when (string-match "on port \\([0-9]+\\)" ws-string)
-        (setq port (string-to-number (match-string 1 ws-string)))
-        (claude-code-ide-debug "Extracted port: %d" port)))
-    ;; If we couldn't extract port from string, we'll have to search all sessions
-    ;; Find session by matching port
-    (when port
+  ;; Find the session that owns this connection by matching the websocket's
+  ;; server process (the one it was accepted on) against the server stored
+  ;; in each session.  This avoids regexing the struct's print form, which
+  ;; was unreliable: `print-level' / `print-length' can truncate the struct
+  ;; before the embedded server-process field.
+  (let* ((server-conn (ignore-errors (websocket-server-conn ws)))
+         (session nil))
+    (claude-code-ide-debug "WebSocket server-conn: %S" server-conn)
+    (when server-conn
       (maphash (lambda (_project-dir s)
-                 (when (eq (claude-code-ide-mcp-session-port s) port)
+                 (when (eq (claude-code-ide-mcp-session-server s) server-conn)
                    (setq session s)))
                claude-code-ide-mcp--sessions))
 
@@ -567,8 +562,8 @@ Optional SESSION contains the MCP session context."
               (setf (claude-code-ide-mcp-session-last-buffer session) (current-buffer))
               ;; Update MCP tools server's last active buffer
               (when-let ((session-id (gethash project-dir claude-code-ide--session-ids)))
-                (claude-code-ide-mcp-server-update-last-active-buffer session-id (current-buffer)))))
-          (claude-code-ide-debug "Warning: Could not find session for WebSocket connection")))))
+                (claude-code-ide-mcp-server-update-last-active-buffer session-id (current-buffer))))))
+      (claude-code-ide-debug "Warning: Could not find session for WebSocket connection"))))
 
 (defun claude-code-ide-mcp--on-message (ws frame)
   "Handle incoming WebSocket message from WS in FRAME."
