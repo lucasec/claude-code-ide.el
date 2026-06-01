@@ -592,6 +592,330 @@ have completed before cleanup.  Waits up to 5 seconds."
       ;; Restore original value
       (setq claude-code-ide-vterm-anti-flicker original-value))))
 
+;;; Terminal Reflow Glitch Prevention Tests
+
+(ert-deftest claude-code-ide-test-prospective-terminal-size-delegates ()
+  "Prospective size defers to the standard reducer with the given args.
+This is what lets the reflow logic honor the user's sizing policy and the
+full cross-frame window list instead of re-deriving it."
+  ;; NOTE: `received' is bound in an outer `let' so the recording lambda
+  ;; captures it lexically.  Binding it in the same `let' as the reducer
+  ;; would not work: `let' init-forms are evaluated in the enclosing scope,
+  ;; so the lambda's reference would resolve as a free variable instead.
+  (let ((received nil))
+    (let ((window-adjust-process-window-size-function
+           (lambda (process windows)
+             (setq received (list process windows))
+             '(80 . 24))))
+      (should (equal (claude-code-ide--prospective-terminal-size
+                      'my-process '(win-a win-b))
+                     '(80 . 24)))
+      ;; The reducer must receive exactly the process and windows we passed.
+      (should (equal received '(my-process (win-a win-b)))))))
+
+(ert-deftest claude-code-ide-test-prospective-terminal-size-no-windows ()
+  "Prospective size is nil when no window displays the buffer."
+  (let ((called nil))
+    (let ((window-adjust-process-window-size-function
+           (lambda (&rest _) (setq called t) '(80 . 24))))
+      (should-not (claude-code-ide--prospective-terminal-size 'proc nil))
+      ;; With no windows we must not even invoke the reducer.
+      (should-not called))))
+
+(ert-deftest claude-code-ide-test-reflow-filter-allows-width-change ()
+  "The reflow filter allows the resize through when width changes."
+  (let ((original-called nil)
+        (claude-code-ide-terminal-backend 'eat)
+        (window-adjust-process-window-size-function
+         (lambda (&rest _) '(100 . 24))))
+    (cl-letf (((symbol-function 'claude-code-ide--session-buffer-p)
+               (lambda (_) t)))
+      (with-temp-buffer
+        (setq-local claude-code-ide--last-reported-size '(80 . 24))
+        ;; A prior suppressed change left a resync pending.
+        (setq-local claude-code-ide--pending-resync t)
+        (let ((original-fn (lambda (&rest _)
+                             (setq original-called t)
+                             '(100 . 24))))
+          (let ((result (claude-code-ide--terminal-reflow-filter
+                         original-fn 'proc '(win))))
+            ;; Width went 80 -> 100, so the resize must be applied...
+            (should original-called)
+            (should (equal result '(100 . 24)))
+            ;; ...and the newly applied size recorded.
+            (should (equal claude-code-ide--last-reported-size '(100 . 24)))
+            ;; ...and the resize re-synced the display, clearing the flag.
+            (should-not claude-code-ide--pending-resync)))))))
+
+(ert-deftest claude-code-ide-test-reflow-filter-suppresses-height-only ()
+  "The reflow filter suppresses a height-only change (width unchanged).
+This is the core workaround for the upstream scrolling glitch."
+  (let ((original-called nil)
+        (claude-code-ide-terminal-backend 'eat)
+        ;; Same width (80), different height (24 -> 40).
+        (window-adjust-process-window-size-function
+         (lambda (&rest _) '(80 . 40))))
+    (cl-letf (((symbol-function 'claude-code-ide--session-buffer-p)
+               (lambda (_) t)))
+      (with-temp-buffer
+        (setq-local claude-code-ide--last-reported-size '(80 . 24))
+        (let ((original-fn (lambda (&rest _)
+                             (setq original-called t)
+                             '(80 . 40))))
+          (let ((result (claude-code-ide--terminal-reflow-filter
+                         original-fn 'proc '(win))))
+            ;; Height-only change must be suppressed.
+            (should-not original-called)
+            (should-not result)
+            ;; Last reported size is unchanged until a real width change
+            ;; or a deferred flush occurs.
+            (should (equal claude-code-ide--last-reported-size '(80 . 24)))
+            ;; The suppressed change must mark the display for resync so the
+            ;; flush redraws it once the window regains focus.
+            (should claude-code-ide--pending-resync)))))))
+
+(ert-deftest claude-code-ide-test-reflow-filter-uses-passed-windows ()
+  "The filter decides from the windows it is handed, not the selected frame.
+This is the multi-frame regression: the resize is computed over every
+window on every frame, so the suppression check must use that same list."
+  (let ((reducer-windows nil))
+    (let ((claude-code-ide-terminal-backend 'eat)
+          (window-adjust-process-window-size-function
+           (lambda (_process windows)
+             (setq reducer-windows windows)
+             '(120 . 24))))
+      (cl-letf (((symbol-function 'claude-code-ide--session-buffer-p)
+                 (lambda (_) t)))
+        (with-temp-buffer
+          (setq-local claude-code-ide--last-reported-size '(80 . 24))
+          (let ((cross-frame-windows '(frame-a-window frame-b-window))
+                (original-fn (lambda (&rest _) '(120 . 24))))
+            (claude-code-ide--terminal-reflow-filter
+             original-fn 'proc cross-frame-windows)
+            ;; The reducer must have seen the full cross-frame window list
+            ;; passed to the filter, never a frame-local substitute.
+            (should (equal reducer-windows cross-frame-windows))))))))
+
+(ert-deftest claude-code-ide-test-reflow-filter-bypass ()
+  "When bypass is set, the filter passes through and records the size."
+  (let ((original-called nil)
+        (claude-code-ide--reflow-bypass t))
+    (cl-letf (((symbol-function 'claude-code-ide--session-buffer-p)
+               (lambda (_) t)))
+      (with-temp-buffer
+        (let ((original-fn (lambda (&rest _)
+                             (setq original-called t)
+                             '(90 . 30))))
+          (let ((result (claude-code-ide--terminal-reflow-filter
+                         original-fn 'proc '(win))))
+            (should original-called)
+            (should (equal result '(90 . 30)))
+            (should (equal claude-code-ide--last-reported-size '(90 . 30)))))))))
+
+(ert-deftest claude-code-ide-test-flush-pending-reflow-fires-on-change ()
+  "Flush dispatches a bypassed resize when the applied size has changed.
+Covers moving the buffer to another frame: the selected window's own
+size need not have changed for the cross-frame applied size to differ."
+  (let ((handler-args nil)
+        (bypass-during-handler nil)
+        (sigwinch-args nil)
+        (claude-code-ide-terminal-backend 'eat)
+        (window-adjust-process-window-size-function
+         (lambda (&rest _) '(100 . 24))))
+    (cl-letf (((symbol-function 'claude-code-ide--session-buffer-p)
+               (lambda (_) t))
+              ((symbol-function 'claude-code-ide--terminal-resize-handler)
+               (lambda () (lambda (proc windows)
+                            (setq handler-args (list proc windows)
+                                  bypass-during-handler
+                                  claude-code-ide--reflow-bypass)
+                            ;; Mirror the real handler: reflow and return
+                            ;; the applied size without signaling the child.
+                            '(100 . 24))))
+              ((symbol-function 'get-buffer-process) (lambda (_) 'proc))
+              ((symbol-function 'process-live-p) (lambda (_) t))
+              ((symbol-function 'set-process-window-size)
+               (lambda (proc height width)
+                 (setq sigwinch-args (list proc height width))))
+              ((symbol-function 'get-buffer-window-list)
+               (lambda (&rest _) '(win-a win-b))))
+      (with-temp-buffer
+        (rename-buffer "*claude-code[flush-test]*" t)
+        (setq-local claude-code-ide--last-reported-size '(80 . 24))
+        (set-window-buffer (selected-window) (current-buffer))
+        (claude-code-ide--flush-pending-reflow nil)
+        ;; Applied width changed 80 -> 100, so the handler must fire...
+        (should (equal handler-args '(proc (win-a win-b))))
+        ;; ...with the bypass flag set so the filter lets it through...
+        (should bypass-during-handler)
+        ;; ...and crucially the child process must be signaled the new size
+        ;; (height . width order), or it keeps rendering at the stale size.
+        (should (equal sigwinch-args '(proc 24 100)))
+        ;; ...and the baseline must advance to the applied size, or a later
+        ;; flush would misread the next change as "unchanged" and skip it.
+        (should (equal claude-code-ide--last-reported-size '(100 . 24)))))))
+
+(ert-deftest claude-code-ide-test-flush-pending-reflow-round-trip ()
+  "Two successive flushes both signal the child as the size swings back.
+Shrinking then re-expanding the min-height window must SIGWINCH on both
+the shrink and the re-expand.  This fails if the baseline is not advanced
+after the first flush, which would make the second read as unchanged."
+  (let ((sigwinch-sizes nil)
+        (current-size '(100 . 53)))
+    (let ((claude-code-ide-terminal-backend 'eat)
+          ;; The reducer reports whatever the windows currently are.
+          (window-adjust-process-window-size-function
+           (lambda (&rest _) current-size)))
+      (cl-letf (((symbol-function 'claude-code-ide--session-buffer-p)
+                 (lambda (b) (string-prefix-p "*claude-code["
+                                              (if (stringp b) b (buffer-name b)))))
+                ((symbol-function 'claude-code-ide--terminal-resize-handler)
+                 (lambda () (lambda (&rest _) current-size)))
+                ((symbol-function 'get-buffer-process) (lambda (_) 'proc))
+                ((symbol-function 'process-live-p) (lambda (_) t))
+                ((symbol-function 'set-process-window-size)
+                 (lambda (_proc height width)
+                   (push (cons width height) sigwinch-sizes)))
+                ((symbol-function 'get-buffer-window-list)
+                 (lambda (&rest _) '(win-a))))
+        (with-temp-buffer
+          (rename-buffer "*claude-code[round-trip]*" t)
+          (setq-local claude-code-ide--last-reported-size '(100 . 53))
+          (set-window-buffer (selected-window) (current-buffer))
+          ;; Shrink: min-height 53 -> 44, refocus flushes.
+          (setq current-size '(100 . 44))
+          (claude-code-ide--flush-pending-reflow nil)
+          ;; Re-expand: min-height 44 -> 53, refocus flushes again.
+          (setq current-size '(100 . 53))
+          (claude-code-ide--flush-pending-reflow nil)
+          ;; Both transitions must have been signaled to the child.
+          (should (equal (reverse sigwinch-sizes)
+                         '((100 . 44) (100 . 53)))))))))
+
+(ert-deftest claude-code-ide-test-flush-pending-reflow-only-selected-window ()
+  "Flush is scoped to the session buffer in the selected window.
+A suppressed height-only change must propagate only once the session
+window regains focus.  When the selected window shows an unrelated buffer
+\(e.g. the minibuffer is active and shrank the session window), the flush
+must be a no-op even though the session buffer's applied size differs."
+  (let ((handler-called nil))
+    (let ((claude-code-ide-terminal-backend 'eat)
+          ;; Height-only change (80x24 -> 80x40): exactly what the filter
+          ;; suppresses; the flush must NOT propagate it while unfocused.
+          (window-adjust-process-window-size-function
+           (lambda (&rest _) '(80 . 40))))
+      (cl-letf (((symbol-function 'claude-code-ide--terminal-resize-handler)
+                 (lambda () (lambda (&rest _) (setq handler-called t) '(80 . 40))))
+                ((symbol-function 'get-buffer-process) (lambda (_) 'proc))
+                ((symbol-function 'process-live-p) (lambda (_) t))
+                ((symbol-function 'get-buffer-window-list)
+                 (lambda (&rest _) '(win-a))))
+        (let ((session-buf (generate-new-buffer "*claude-code[unfocused]*"))
+              ;; The mocked `get-buffer-process' returns a non-process, which
+              ;; would trip `process-kill-buffer-query-function' at cleanup.
+              (kill-buffer-query-functions nil))
+          (unwind-protect
+              (progn
+                (with-current-buffer session-buf
+                  (setq-local claude-code-ide--last-reported-size '(80 . 24)))
+                ;; Selected window shows an unrelated buffer, mimicking the
+                ;; minibuffer being active while the session window shrank.
+                (with-temp-buffer
+                  (claude-code-ide--flush-pending-reflow nil))
+                ;; The session buffer is not in the selected window, so its
+                ;; deferred height-only change must NOT be dispatched yet.
+                (should-not handler-called))
+            (kill-buffer session-buf)))))))
+
+(ert-deftest claude-code-ide-test-flush-pending-reflow-selected-window ()
+  "Flush fires for the session buffer shown in the selected window.
+Covers regaining focus on the session window (e.g. closing the
+minibuffer): the deferred resize settles and is signaled to the child."
+  (let ((handler-args nil)
+        (sigwinch-args nil))
+    (let ((claude-code-ide-terminal-backend 'eat)
+          (window-adjust-process-window-size-function
+           (lambda (&rest _) '(80 . 40))))
+      (cl-letf (((symbol-function 'claude-code-ide--session-buffer-p)
+                 (lambda (b) (string-prefix-p "*claude-code["
+                                              (if (stringp b) b (buffer-name b)))))
+                ((symbol-function 'claude-code-ide--terminal-resize-handler)
+                 (lambda () (lambda (proc windows)
+                              (setq handler-args (list proc windows))
+                              '(80 . 40))))
+                ((symbol-function 'get-buffer-process) (lambda (_) 'proc))
+                ((symbol-function 'process-live-p) (lambda (_) t))
+                ((symbol-function 'set-process-window-size)
+                 (lambda (proc height width)
+                   (setq sigwinch-args (list proc height width))))
+                ((symbol-function 'get-buffer-window-list)
+                 (lambda (&rest _) '(win-a))))
+        (with-temp-buffer
+          (rename-buffer "*claude-code[focused]*" t)
+          (setq-local claude-code-ide--last-reported-size '(80 . 24))
+          (set-window-buffer (selected-window) (current-buffer))
+          (claude-code-ide--flush-pending-reflow nil)
+          ;; The session buffer is in the selected window, so the deferred
+          ;; resize dispatches and the child is signaled the settled size.
+          (should (equal handler-args '(proc (win-a))))
+          (should (equal sigwinch-args '(proc 40 80))))))))
+
+(ert-deftest claude-code-ide-test-flush-pending-reflow-resync-on-focus ()
+  "Flush re-syncs the display when a resync is pending and size is unchanged.
+Covers the two-window case where the minibuffer changed the focused
+window's height but not the cross-frame applied size: on refocus the
+handler must re-run to redraw, yet the child must NOT be re-signaled
+since its size did not change."
+  (let ((handler-called nil)
+        (sigwinch-called nil))
+    (let ((claude-code-ide-terminal-backend 'eat)
+          ;; Applied size is identical to the last reported size.
+          (window-adjust-process-window-size-function
+           (lambda (&rest _) '(100 . 53))))
+      (cl-letf (((symbol-function 'claude-code-ide--session-buffer-p)
+                 (lambda (b) (string-prefix-p "*claude-code["
+                                              (if (stringp b) b (buffer-name b)))))
+                ((symbol-function 'claude-code-ide--terminal-resize-handler)
+                 (lambda () (lambda (&rest _) (setq handler-called t) '(100 . 53))))
+                ((symbol-function 'get-buffer-process) (lambda (_) 'proc))
+                ((symbol-function 'process-live-p) (lambda (_) t))
+                ((symbol-function 'set-process-window-size)
+                 (lambda (&rest _) (setq sigwinch-called t)))
+                ((symbol-function 'get-buffer-window-list)
+                 (lambda (&rest _) '(win-a))))
+        (with-temp-buffer
+          (rename-buffer "*claude-code[resync]*" t)
+          (setq-local claude-code-ide--last-reported-size '(100 . 53))
+          (setq-local claude-code-ide--pending-resync t)
+          (set-window-buffer (selected-window) (current-buffer))
+          (claude-code-ide--flush-pending-reflow nil)
+          ;; The handler must run to re-sync the display...
+          (should handler-called)
+          ;; ...the pending flag must be cleared...
+          (should-not claude-code-ide--pending-resync)
+          ;; ...and the child must NOT be re-signaled (size unchanged).
+          (should-not sigwinch-called))))))
+
+(ert-deftest claude-code-ide-test-flush-pending-reflow-noop-when-stable ()
+  "Flush does nothing when the applied size matches the last reported size."
+  (let ((handler-called nil)
+        (claude-code-ide-terminal-backend 'eat)
+        (window-adjust-process-window-size-function
+         (lambda (&rest _) '(80 . 24))))
+    (cl-letf (((symbol-function 'claude-code-ide--session-buffer-p)
+               (lambda (_) t))
+              ((symbol-function 'claude-code-ide--terminal-resize-handler)
+               (lambda () (lambda (&rest _) (setq handler-called t))))
+              ((symbol-function 'get-buffer-process) (lambda (_) 'proc))
+              ((symbol-function 'get-buffer-window-list)
+               (lambda (&rest _) '(win-a))))
+      (with-temp-buffer
+        (rename-buffer "*claude-code[flush-stable]*" t)
+        (setq-local claude-code-ide--last-reported-size '(80 . 24))
+        (set-window-buffer (selected-window) (current-buffer))
+        (claude-code-ide--flush-pending-reflow nil)
+        (should-not handler-called)))))
+
 (ert-deftest claude-code-ide-test-run-with-cli ()
   "Test successful run command execution."
   (skip-unless nil) ; Skip this test for now

@@ -550,27 +550,87 @@ This function binds:
     (string-prefix-p "*claude-code[" name)))
 
 (defvar-local claude-code-ide--last-reported-size nil
-  "The last terminal size reported as (WIDTH . HEIGHT), or nil if never reported.")
+  "The last terminal size reported as (WIDTH . HEIGHT), or nil if never reported.
+This is the size actually applied to the terminal, as computed by
+`window-adjust-process-window-size-function' across all windows
+displaying the session buffer on any frame.")
 
 (defvar claude-code-ide--reflow-bypass nil
   "When non-nil, the reflow filter passes through unconditionally.")
 
-(defun claude-code-ide--flush-pending-reflow (_frame)
-  "Send a deferred resize if the terminal size has changed since last report.
-Called via `window-selection-change-functions' when a window is selected.
-_FRAME is the frame whose selection changed (ignored)."
-  (when-let* ((buf (window-buffer (selected-window)))
-              ((claude-code-ide--session-buffer-p buf))
-              ((buffer-local-value 'claude-code-ide--last-reported-size buf)))
+(defvar-local claude-code-ide--pending-resync nil
+  "Non-nil when a height-only reflow was suppressed for this buffer.
+The filter suppresses height-only changes (the bug #1422 workaround),
+which skips eat's redisplay and scroll synchronization.  When the
+session window is later re-selected, the flush re-runs the resize handler
+to re-sync the display even if the applied terminal size is unchanged.")
+
+(defun claude-code-ide--prospective-terminal-size (process windows)
+  "Return the (WIDTH . HEIGHT) the terminal would be resized to.
+This defers to `window-adjust-process-window-size-function', the same
+reducer the backend itself calls, so it honors the user's configured
+sizing policy and the full cross-frame WINDOWS list Emacs supplies.
+PROCESS and WINDOWS are the arguments the backend's resize handler
+received.  Return nil if WINDOWS is empty or the reducer returns nil."
+  (when windows
+    (funcall window-adjust-process-window-size-function process windows)))
+
+(defun claude-code-ide--flush-buffer-reflow (buf)
+  "Re-sync or resize session BUF after a suppressed height-only reflow.
+The filter suppresses height-only changes to work around the upstream
+scrolling glitch, which skips eat's redisplay/scroll sync and may leave
+the applied terminal size stale.  This re-runs the resize handler when
+either is true:
+- a resync is pending (`claude-code-ide--pending-resync'): the display
+  was left out of sync by a suppressed change and must be redrawn now
+  that the window is focused, even if the applied size is unchanged;
+- the size the backend would apply differs from the last reported one.
+The size is computed across all windows on all frames, so it is correct
+no matter which window or frame triggered the flush."
+  (when (and (buffer-live-p buf)
+             (claude-code-ide--session-buffer-p buf)
+             (buffer-local-value 'claude-code-ide--last-reported-size buf))
     (with-current-buffer buf
-      (let ((cur-width (window-max-chars-per-line))
-            (cur-height (floor (window-screen-lines))))
-        (unless (equal claude-code-ide--last-reported-size
-                       (cons cur-width cur-height))
-          (let ((claude-code-ide--reflow-bypass t))
-            (funcall (claude-code-ide--terminal-resize-handler)
-                     (get-buffer-process buf)
-                     (get-buffer-window-list buf nil t))))))))
+      (let* ((proc (get-buffer-process buf))
+             (windows (get-buffer-window-list buf nil t))
+             (prospective (claude-code-ide--prospective-terminal-size
+                           proc windows))
+             (size-changed (and prospective
+                                (not (equal claude-code-ide--last-reported-size
+                                            prospective)))))
+        (when (and prospective
+                   (or size-changed claude-code-ide--pending-resync))
+          (let* ((claude-code-ide--reflow-bypass t)
+                 (applied (funcall (claude-code-ide--terminal-resize-handler)
+                                   proc windows)))
+            (setq claude-code-ide--pending-resync nil)
+            ;; Advance the baseline to the size we just applied, exactly as
+            ;; the filter does on its allow path.  Without this the baseline
+            ;; goes stale after the first flush and the next genuine change
+            ;; is misread as "unchanged" and never sent.
+            (when applied
+              (setq claude-code-ide--last-reported-size
+                    (cons (car applied) (cdr applied))))
+            ;; The resize handler only reflows the terminal's own display and
+            ;; returns the size; it does NOT signal the child process.  On
+            ;; the normal path Emacs follows the handler with
+            ;; `set-process-window-size', but our manual flush bypasses that,
+            ;; so do it here or the child keeps its stale size.
+            (when (and applied (process-live-p proc) size-changed)
+              (set-process-window-size proc (cdr applied) (car applied)))))))))
+
+(defun claude-code-ide--flush-pending-reflow (_arg)
+  "Flush a deferred resize for the session buffer in the selected window.
+Registered on `window-selection-change-functions' and
+`window-buffer-change-functions'.  _ARG is the frame or window passed by
+those hooks (ignored).
+
+Scoping to the selected window is deliberate: a suppressed height-only
+change must propagate only once the session window regains focus.  For
+example, opening the minibuffer shrinks the session window but selects
+the minibuffer (not a session) so nothing flushes; closing it returns
+focus to the session window, which then flushes the settled size."
+  (claude-code-ide--flush-buffer-reflow (window-buffer (selected-window))))
 
 
 (defun claude-code-ide--terminal-reflow-filter (original-fn &rest args)
@@ -585,29 +645,35 @@ width has actually changed, working around the scrolling glitch."
           (setq claude-code-ide--last-reported-size
                 (cons (car result) (cdr result))))
         result)
-    ;; Check if width actually changed for any Claude session window
-    (let ((dimensions-stable t))
-      (dolist (win (window-list))
-        (when-let* ((buf (window-buffer win))
-                    ((claude-code-ide--session-buffer-p buf)))
-          (let* ((new-width (window-width win))
-                 (cached-width (window-parameter win 'claude-code-ide-cached-width)))
-            (unless (eql new-width cached-width)
-              (setq dimensions-stable nil)
-              (set-window-parameter win 'claude-code-ide-cached-width new-width)))))
+    ;; Decide based on the size the backend would actually apply.  We ask
+    ;; the same reducer the backend uses, passing through the (process
+    ;; windows) arguments Emacs handed us, so the check sees the full
+    ;; cross-frame window list rather than just the selected frame's.  This
+    ;; keeps the width comparison correct when the buffer is shown in, or
+    ;; moved between, multiple frames.
+    (let* ((prospective (apply #'claude-code-ide--prospective-terminal-size
+                               args))
+           (width-changed (and prospective
+                               (not (eql (car prospective)
+                                         (car claude-code-ide--last-reported-size))))))
       (cond
        ;; In scroll mode - suppress reflow entirely
        ((claude-code-ide--terminal-scroll-mode-active-p)
         nil)
-       ;; Width changed - allow reflow and record reported size
-       ((not dimensions-stable)
+       ;; Width changed - allow reflow and record reported size.  The
+       ;; handler re-syncs the display, so any pending resync is satisfied.
+       (width-changed
         (let ((result (apply original-fn args)))
           (when result
             (setq claude-code-ide--last-reported-size
-                  (cons (car result) (cdr result))))
+                  (cons (car result) (cdr result))
+                  claude-code-ide--pending-resync nil))
           result))
-       ;; No width change - suppress, will flush on window selection
+       ;; No width change - suppress.  Mark the display out of sync so the
+       ;; flush re-syncs it once the session window regains focus (e.g. the
+       ;; window's height changed under a minibuffer and must be redrawn).
        (t
+        (setq claude-code-ide--pending-resync t)
         nil)))))
 
 
@@ -663,6 +729,7 @@ Saves window state BEFORE dispatch, restores AFTER if a clear occurred."
                          (max new-pmin (- new-pmax point-offset))))
                     (set-window-start win new-start t)
                     (set-window-point win new-point)))))))))))
+
 ;;; Helper Functions
 
 (defun claude-code-ide--default-buffer-name (directory)
@@ -696,6 +763,11 @@ If DIRECTORY is not provided, use the current working directory."
       (advice-add (claude-code-ide--terminal-resize-handler)
                   :around #'claude-code-ide--terminal-reflow-filter)
       (add-hook 'window-selection-change-functions
+                #'claude-code-ide--flush-pending-reflow)
+      ;; Also flush when a window's buffer changes: switching a window to a
+      ;; session buffer (without changing the selected window) does not fire
+      ;; the selection hook, but does change the size the backend should use.
+      (add-hook 'window-buffer-change-functions
                 #'claude-code-ide--flush-pending-reflow))
     (when claude-code-ide-eat-preserve-position
       (advice-add 'eat--process-output-queue
@@ -792,6 +864,8 @@ If `claude-code-ide-focus-on-open' is non-nil, the window is selected."
             (advice-remove 'eat--t-erase-in-disp
                            #'claude-code-ide--track-scrollback-clear)
             (remove-hook 'window-selection-change-functions
+                         #'claude-code-ide--flush-pending-reflow)
+            (remove-hook 'window-buffer-change-functions
                          #'claude-code-ide--flush-pending-reflow))
           ;; Remove vterm rendering optimization if no sessions remain
           (when (and (eq claude-code-ide-terminal-backend 'vterm)
@@ -985,13 +1059,16 @@ Signals an error if terminal fails to initialize."
           ;; Set up eat mode
           (unless (eq major-mode 'eat-mode)
             (eat-mode))
-          ;; Record initial terminal size for deferred resize tracking
+          ;; Record initial terminal size for deferred resize tracking.
+          ;; Seed it with the size the backend will actually apply across
+          ;; all windows showing the buffer, matching the value the reflow
+          ;; filter and flush compare against.  The process does not exist
+          ;; yet, but the size reducer derives its result from the windows.
           (when claude-code-ide-prevent-reflow-glitch
-            (when-let ((win (get-buffer-window buffer t)))
-              (setq-local claude-code-ide--last-reported-size
-                          (with-selected-window win
-                            (cons (window-max-chars-per-line)
-                                  (floor (window-screen-lines)))))))
+            (when-let* ((windows (get-buffer-window-list buffer nil t))
+                        (size (claude-code-ide--prospective-terminal-size
+                               (get-buffer-process buffer) windows)))
+              (setq-local claude-code-ide--last-reported-size size)))
           ;; Prepend our env vars to the buffer-local process-environment
           (setq-local process-environment
                       (append env-vars process-environment))
