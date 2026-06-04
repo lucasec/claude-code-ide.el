@@ -1218,15 +1218,13 @@ If the buffer is already visible, switch focus to it."
 
 ;;;###autoload
 (defun claude-code-ide-insert-newline ()
-  "Send newline (backslash + return) to the Claude Code terminal buffer for the current project.
-This simulates typing backslash followed by Enter, which Claude Code interprets as a newline."
+  "Send a newline to the Claude Code terminal buffer for the current project.
+This uses the ESC + carriage return sequence, which Claude Code interprets as a newline."
   (interactive)
   (let ((buffer-name (claude-code-ide--get-buffer-name)))
     (if-let ((buffer (get-buffer buffer-name)))
         (with-current-buffer buffer
-          (claude-code-ide--terminal-send-string "\\")
-          ;; Small delay to ensure prompt text is processed before sending return
-          (sit-for 0.1)
+          (claude-code-ide--terminal-send-escape)
           (claude-code-ide--terminal-send-return))
       (user-error "No Claude Code session for this project"))))
 
