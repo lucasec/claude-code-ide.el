@@ -32,6 +32,7 @@
 
 ;; Declare functions from other files to avoid circular dependencies
 (declare-function claude-code-ide "claude-code-ide" ())
+(declare-function claude-code-ide-agent-view "claude-code-ide" ())
 (declare-function claude-code-ide-resume "claude-code-ide" ())
 (declare-function claude-code-ide-continue "claude-code-ide" ())
 (declare-function claude-code-ide-stop "claude-code-ide" ())
@@ -90,6 +91,23 @@
         (claude-code-ide-log "Claude Code session already running in %s"
                              (abbreviate-file-name working-dir)))
     (claude-code-ide)))
+
+(defun claude-code-ide--agent-view-description ()
+  "Dynamic description for the agent-view command based on session status."
+  (if (claude-code-ide--has-active-session-p)
+      (propertize "Open Agent View (session already running)"
+                  'face 'transient-inactive-value)
+    "Open Agent View"))
+
+(defun claude-code-ide--agent-view-if-no-session ()
+  "Start the Claude Code agent view only if no session is active for
+current buffer."
+  (interactive)
+  (if (claude-code-ide--has-active-session-p)
+      (let ((working-dir (claude-code-ide--get-working-directory)))
+        (claude-code-ide-log "Claude Code session already running in %s"
+                             (abbreviate-file-name working-dir)))
+    (claude-code-ide-agent-view)))
 
 (defun claude-code-ide--continue-description ()
   "Dynamic description for continue command based on session status."
@@ -319,6 +337,7 @@ Otherwise, if multiple sessions exist, prompt for selection."
   ["Claude Code IDE"
    ["Session Management"
     ("s" claude-code-ide--start-if-no-session :description claude-code-ide--start-description)
+    ("a" claude-code-ide--agent-view-if-no-session :description claude-code-ide--agent-view-description)
     ("c" claude-code-ide--continue-if-no-session :description claude-code-ide--continue-description)
     ("r" claude-code-ide--resume-if-no-session :description claude-code-ide--resume-description)
     ("q" "Stop current session" claude-code-ide-stop)

@@ -929,11 +929,12 @@ If the window is not visible, it will be shown in a side window."
             (setf (claude-code-ide-mcp-session-original-tab session) (tab-bar--current-tab))))
         (claude-code-ide-debug "Claude Code window shown")))))
 
-(defun claude-code-ide--build-claude-command (&optional continue resume session-id)
+(defun claude-code-ide--build-claude-command (&optional continue resume session-id agents)
   "Build the Claude command with optional flags.
 If CONTINUE is non-nil, add the -c flag.
 If RESUME is non-nil, add the -r flag.
 If SESSION-ID is provided, it's included in the MCP server URL path.
+If AGENTS is non-nil, launch the `agents' subcommand instead of an interactive coding session.
 If `claude-code-ide-cli-debug' is non-nil, add the -d flag.
 If `claude-code-ide-system-prompt' is non-nil, add the --append-system-prompt flag.
 Additional flags from `claude-code-ide-cli-extra-flags' are also included."
@@ -965,26 +966,45 @@ Additional flags from `claude-code-ide-cli-extra-flags' are also included."
     ;; Add MCP tools config if enabled
     (when (claude-code-ide-mcp-server-ensure-server)
       (when-let ((config (claude-code-ide-mcp-server-get-config session-id)))
-        (let ((json-str (json-encode config)))
+        (let ((json-str (json-encode config))
+              ;; The list of tool names/patterns to allow, as a list of
+              ;; strings (a custom string pattern is split on whitespace).
+              (tool-list
+               (cond
+                ;; Auto mode: get all emacs-tools names
+                ((eq claude-code-ide-mcp-allowed-tools 'auto)
+                 (claude-code-ide-mcp-server-get-tool-names "mcp__emacs-tools__"))
+                ;; List of specific tools
+                ((listp claude-code-ide-mcp-allowed-tools)
+                 claude-code-ide-mcp-allowed-tools)
+                ;; String pattern
+                ((stringp claude-code-ide-mcp-allowed-tools)
+                 (split-string claude-code-ide-mcp-allowed-tools nil t))
+                ;; nil/disabled
+                (t nil))))
           (claude-code-ide-debug "MCP tools config JSON: %s" json-str)
           ;; For vterm, we need to escape for sh -c context
           ;; First escape backslashes, then quotes
           (setq json-str (replace-regexp-in-string "\\\\" "\\\\\\\\" json-str))
           (setq json-str (replace-regexp-in-string "\"" "\\\\\"" json-str))
-          (setq claude-cmd (concat claude-cmd " --mcp-config \"" json-str "\""))
-          ;; Add allowedTools flag if configured
-          (let ((allowed-tools
-                 (cond
-                  ;; Auto mode: get all emacs-tools names
-                  ((eq claude-code-ide-mcp-allowed-tools 'auto)
-                   (mapconcat 'identity (claude-code-ide-mcp-server-get-tool-names "mcp__emacs-tools__") " "))
-                  ;; List of specific tools
-                  ((listp claude-code-ide-mcp-allowed-tools)
-                   (mapconcat 'identity claude-code-ide-mcp-allowed-tools " "))
-                  ;; String pattern or nil
-                  (t claude-code-ide-mcp-allowed-tools))))
-            (when allowed-tools
-              (setq claude-cmd (concat claude-cmd " --allowedTools " allowed-tools)))))))
+          ;; --mcp-config and --allowedTools are variadic flags: in the
+          ;; space-separated form their values would greedily consume a
+          ;; following bare token.  For the agents view that token is the
+          ;; `agents' subcommand (appended below), which must survive, so we
+          ;; emit the non-greedy "=" form there.  Interactive sessions have no
+          ;; trailing subcommand and keep the original space form.
+          (if agents
+              (progn
+                (setq claude-cmd (concat claude-cmd " --mcp-config=\"" json-str "\""))
+                (dolist (tool tool-list)
+                  (setq claude-cmd (concat claude-cmd " --allowedTools=" tool))))
+            (setq claude-cmd (concat claude-cmd " --mcp-config \"" json-str "\""))
+            (when tool-list
+              (setq claude-cmd (concat claude-cmd " --allowedTools "
+                                       (mapconcat #'identity tool-list " "))))))))
+    ;; The agents subcommand goes last, after all global flags.
+    (when agents
+      (setq claude-cmd (concat claude-cmd " agents")))
     claude-cmd))
 
 
@@ -997,7 +1017,7 @@ and args is a list of arguments."
     (cons (car parts) (cdr parts))))
 
 
-(defun claude-code-ide--create-terminal-session (buffer-name working-dir port continue resume session-id)
+(defun claude-code-ide--create-terminal-session (buffer-name working-dir port continue resume session-id &optional agents)
   "Create a new terminal session for Claude Code.
 BUFFER-NAME is the name for the terminal buffer.
 WORKING-DIR is the working directory.
@@ -1005,12 +1025,13 @@ PORT is the MCP server port.
 CONTINUE is whether to continue the most recent conversation.
 RESUME is whether to resume a previous conversation.
 SESSION-ID is the unique identifier for this session.
+AGENTS is whether to launch the agent view instead of a standard session.
 
 Returns a cons cell of (buffer . process) on success.
 Signals an error if terminal fails to initialize."
   ;; Ensure terminal backend is available before proceeding
   (claude-code-ide--terminal-ensure-backend)
-  (let* ((claude-cmd (claude-code-ide--build-claude-command continue resume session-id))
+  (let* ((claude-cmd (claude-code-ide--build-claude-command continue resume session-id agents))
          (default-directory working-dir)
          (env-vars (list (format "CLAUDE_CODE_SSE_PORT=%d" port)
                          "TERM_PROGRAM=ghostty"
@@ -1082,10 +1103,11 @@ Signals an error if terminal fails to initialize."
      (t
       (error "Unknown terminal backend: %s" claude-code-ide-terminal-backend)))))
 
-(defun claude-code-ide--start-session (&optional continue resume)
+(defun claude-code-ide--start-session (&optional continue resume agents)
   "Start a Claude Code session for the current project.
 If CONTINUE is non-nil, start Claude with the -c (continue) flag.
 If RESUME is non-nil, start Claude with the -r (resume) flag.
+If AGENTS is non-nil, launch Claude agent view.
 
 This function handles:
 - CLI availability checking
@@ -1122,7 +1144,7 @@ This function handles:
               (setq port (claude-code-ide-mcp-start working-dir))
               ;; Create new terminal session
               (let* ((buffer-and-process (claude-code-ide--create-terminal-session
-                                          buffer-name working-dir port continue resume session-id))
+                                          buffer-name working-dir port continue resume session-id agents))
                      (buffer (car buffer-and-process))
                      (process (cdr buffer-and-process)))
                 ;; Notify MCP tools server about new session with session info
@@ -1170,7 +1192,8 @@ This function handles:
                 ;; Display the buffer in a side window
                 (claude-code-ide--display-buffer-in-side-window buffer)
                 (claude-code-ide-log "Claude Code %sstarted in %s with MCP on port %d%s"
-                                     (cond (continue "continued and ")
+                                     (cond (agents "agent view ")
+                                           (continue "continued and ")
                                            (resume "resumed and ")
                                            (t ""))
                                      (file-name-nondirectory (directory-file-name working-dir))
@@ -1204,6 +1227,16 @@ This starts Claude with the -c (continue) flag to continue the most recent
 conversation in the current directory."
   (interactive)
   (claude-code-ide--start-session t))
+
+;;;###autoload
+(defun claude-code-ide-agent-view ()
+  "Launch the Claude Code agent view for the current project or directory.
+This starts Claude with the `agents' subcommand, which opens the
+background agent management view. Agent view is launched in the current
+directory so background agents can be easily dispatched against the
+current project."
+  (interactive)
+  (claude-code-ide--start-session nil nil t))
 
 ;;;###autoload
 (defun claude-code-ide-check-status ()

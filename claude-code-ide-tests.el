@@ -511,6 +511,100 @@ have completed before cleanup.  Waits up to 5 seconds."
             (should (processp (cdr result)))
             (should (bufferp mock-eat-buffer))))))))
 
+(ert-deftest claude-code-ide-test-build-command-agents-subcommand-last ()
+  "The agents view appends the `agents' subcommand after all global flags."
+  (let ((claude-code-ide-cli-path "claude")
+        (claude-code-ide-cli-debug nil)
+        (claude-code-ide-cli-extra-flags "")
+        (claude-code-ide-system-prompt nil))
+    ;; Disable the MCP server so the command is just the globals + subcommand.
+    (cl-letf (((symbol-function 'claude-code-ide-mcp-server-ensure-server)
+               (lambda () nil)))
+      (let ((cmd (claude-code-ide--build-claude-command nil nil nil t)))
+        ;; The append-system-prompt global is always emitted, before the
+        ;; subcommand, and `agents' is the final token.
+        (should (string-match-p "--append-system-prompt" cmd))
+        (should (string-suffix-p " agents" cmd))
+        ;; The Emacs context prompt must precede the subcommand.
+        (should (< (string-match "--append-system-prompt" cmd)
+                   (string-match " agents" cmd)))))))
+
+(ert-deftest claude-code-ide-test-build-command-agents-omits-continue-resume ()
+  "Continue/resume flags do not apply to the agents view."
+  (let ((claude-code-ide-cli-path "claude")
+        (claude-code-ide-cli-debug nil)
+        (claude-code-ide-cli-extra-flags "")
+        (claude-code-ide-system-prompt nil))
+    (cl-letf (((symbol-function 'claude-code-ide-mcp-server-ensure-server)
+               (lambda () nil)))
+      ;; Even when continue and resume are requested, the agents command must
+      ;; not carry -c or -r.
+      (let ((cmd (claude-code-ide--build-claude-command t t nil t)))
+        (should-not (string-match-p " -c\\b" cmd))
+        (should-not (string-match-p " -r\\b" cmd))
+        (should (string-suffix-p " agents" cmd)))
+      ;; But an interactive session still honors them.
+      (let ((cmd (claude-code-ide--build-claude-command t t nil nil)))
+        (should (string-match-p " -c\\b" cmd))
+        (should (string-match-p " -r\\b" cmd))
+        (should-not (string-match-p "agents" cmd))))))
+
+(ert-deftest claude-code-ide-test-build-command-agents-mcp-config ()
+  "The agents view emits variadic MCP flags in non-greedy \"=\" form.
+The space-separated form of --mcp-config/--allowedTools would greedily
+consume the trailing `agents' token, so the agents path must use the
+\"=\" form to keep the subcommand intact."
+  (let ((claude-code-ide-cli-path "claude")
+        (claude-code-ide-cli-debug nil)
+        (claude-code-ide-cli-extra-flags "")
+        (claude-code-ide-system-prompt nil)
+        (claude-code-ide-mcp-allowed-tools 'auto))
+    (cl-letf (((symbol-function 'claude-code-ide-mcp-server-ensure-server)
+               (lambda () t))
+              ((symbol-function 'claude-code-ide-mcp-server-get-config)
+               (lambda (&rest _)
+                 '((mcpServers . ((emacs-tools . ((type . "http"))))))))
+              ((symbol-function 'claude-code-ide-mcp-server-get-tool-names)
+               (lambda (&rest _) '("mcp__emacs-tools__a" "mcp__emacs-tools__b"))))
+      (let ((cmd (claude-code-ide--build-claude-command nil nil "sess" t)))
+        ;; The config is present and, being a global flag, precedes `agents'.
+        (should (string-match-p "--mcp-config=" cmd))
+        (should (string-suffix-p " agents" cmd))
+        (should (< (string-match "--mcp-config=" cmd)
+                   (string-match " agents" cmd)))
+        ;; Each allowed tool uses the non-greedy "=" form (one flag per
+        ;; tool), so none of them can swallow the `agents' token.
+        (should (string-match-p "--allowedTools=mcp__emacs-tools__a" cmd))
+        (should (string-match-p "--allowedTools=mcp__emacs-tools__b" cmd))
+        (should-not (string-match-p "--allowedTools [^=]" cmd))
+        ;; And every allowedTools flag must come before the subcommand.
+        (let ((agents-pos (string-match " agents" cmd))
+              (search 0))
+          (while (string-match "--allowedTools=" cmd search)
+            (should (< (match-beginning 0) agents-pos))
+            (setq search (match-end 0))))))))
+
+(ert-deftest claude-code-ide-test-build-command-session-mcp-space-form ()
+  "An interactive session keeps the space-separated variadic MCP form."
+  (let ((claude-code-ide-cli-path "claude")
+        (claude-code-ide-cli-debug nil)
+        (claude-code-ide-cli-extra-flags "")
+        (claude-code-ide-system-prompt nil)
+        (claude-code-ide-mcp-allowed-tools 'auto))
+    (cl-letf (((symbol-function 'claude-code-ide-mcp-server-ensure-server)
+               (lambda () t))
+              ((symbol-function 'claude-code-ide-mcp-server-get-config)
+               (lambda (&rest _)
+                 '((mcpServers . ((emacs-tools . ((type . "http"))))))))
+              ((symbol-function 'claude-code-ide-mcp-server-get-tool-names)
+               (lambda (&rest _) '("mcp__emacs-tools__a" "mcp__emacs-tools__b"))))
+      (let ((cmd (claude-code-ide--build-claude-command nil nil "sess" nil)))
+        ;; Interactive sessions have no trailing subcommand, so the original
+        ;; space form is preserved (a single --allowedTools with all tools).
+        (should (string-match-p "--mcp-config \"" cmd))
+        (should (string-match-p "--allowedTools mcp__emacs-tools__a mcp__emacs-tools__b" cmd))
+        (should-not (string-match-p "agents" cmd))))))
+
 (ert-deftest claude-code-ide-test-vterm-smart-renderer-passthrough ()
   "Test that vterm smart renderer passes through normal text immediately."
   (let ((orig-fun-called nil)
